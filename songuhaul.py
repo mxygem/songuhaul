@@ -20,10 +20,18 @@ ARCHIVE_EXTENSIONS = {".zip", ".7z"}
 
 
 @dataclass(frozen=True)
+class SongDiscovery:
+    source: Path
+    archive: Path | None
+    deletable_archive: Path | None
+
+
+@dataclass(frozen=True)
 class MovePlan:
     source: Path
     destination: Path
     archive: Path | None
+    deletable_archive: Path | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +57,11 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Print what would be moved without writing changes. Use --no-dry-run to move files.",
+    )
+    parser.add_argument(
+        "--delete-archives",
+        action="store_true",
+        help="Delete original input archives after their song folders are successfully moved.",
     )
     return parser.parse_args()
 
@@ -137,16 +150,17 @@ def extract_7z_archive(archive: Path, destination: Path) -> None:
     subprocess.run([bsdtar, "-xf", str(archive), "-C", str(destination)], check=True)
 
 
-def collect_song_directories(input_dir: Path, work_dir: Path) -> list[tuple[Path, Path | None]]:
-    """Return pairs of (song directory, archive it came from)."""
-    discovered: list[tuple[Path, Path | None]] = [
-        (song_dir, None) for song_dir in find_song_directories(input_dir)
+def collect_song_directories(input_dir: Path, work_dir: Path) -> list[SongDiscovery]:
+    """Return song folders and the archives they came from."""
+    discovered = [
+        SongDiscovery(source=song_dir, archive=None, deletable_archive=None)
+        for song_dir in find_song_directories(input_dir)
     ]
     seen_archives: set[Path] = set()
-    pending_archives = find_archives(input_dir)
+    pending_archives = [(archive, archive) for archive in find_archives(input_dir)]
 
     while pending_archives:
-        archive = pending_archives.pop(0)
+        archive, deletable_archive = pending_archives.pop(0)
         archive_key = archive.resolve() if archive.exists() else archive
         if archive_key in seen_archives:
             continue
@@ -167,9 +181,17 @@ def collect_song_directories(input_dir: Path, work_dir: Path) -> list[tuple[Path
             continue
 
         for song_dir in find_song_directories(extract_to):
-            discovered.append((song_dir, archive))
+            discovered.append(
+                SongDiscovery(
+                    source=song_dir,
+                    archive=archive,
+                    deletable_archive=deletable_archive,
+                )
+            )
 
-        pending_archives.extend(find_archives(extract_to))
+        pending_archives.extend(
+            (nested_archive, deletable_archive) for nested_archive in find_archives(extract_to)
+        )
 
     return discovered
 
@@ -189,18 +211,32 @@ def unique_destination(output_dir: Path, name: str, reserved: set[Path]) -> Path
         counter += 1
 
 
-def build_move_plan(song_dirs: list[tuple[Path, Path | None]], output_dir: Path) -> list[MovePlan]:
+def build_move_plan(song_dirs: list[SongDiscovery], output_dir: Path) -> list[MovePlan]:
     reserved: set[Path] = set()
     plan: list[MovePlan] = []
 
-    for song_dir, archive in song_dirs:
-        destination = unique_destination(output_dir, song_dir.name, reserved)
-        plan.append(MovePlan(source=song_dir, destination=destination, archive=archive))
+    for song_dir in song_dirs:
+        destination = unique_destination(output_dir, song_dir.source.name, reserved)
+        plan.append(
+            MovePlan(
+                source=song_dir.source,
+                destination=destination,
+                archive=song_dir.archive,
+                deletable_archive=song_dir.deletable_archive,
+            )
+        )
 
     return plan
 
 
-def print_plan(plan: list[MovePlan]) -> None:
+def archives_to_delete(plan: list[MovePlan]) -> list[Path]:
+    archives = {
+        item.deletable_archive for item in plan if item.deletable_archive is not None
+    }
+    return sorted(archives, key=lambda p: str(p))
+
+
+def print_plan(plan: list[MovePlan], delete_archives: bool = False) -> None:
     if not plan:
         print("No Clone Hero song folders found in zip archives.")
         return
@@ -210,12 +246,26 @@ def print_plan(plan: list[MovePlan]) -> None:
         source_description = f"from {item.archive}" if item.archive else "unarchived"
         print(f"- {item.source} -> {item.destination} ({source_description})")
 
+    if delete_archives:
+        archives = archives_to_delete(plan)
+        if archives:
+            print()
+            print("Dry run: the following input archives would be deleted after successful moves:")
+            for archive in archives:
+                print(f"- {archive}")
 
-def move_songs(plan: list[MovePlan], output_dir: Path) -> None:
+
+def move_songs(plan: list[MovePlan], output_dir: Path, delete_archives: bool = False) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for item in plan:
         shutil.move(str(item.source), str(item.destination))
         print(f"Moved {item.destination}")
+
+    if delete_archives:
+        for archive in archives_to_delete(plan):
+            if archive.exists():
+                archive.unlink()
+                print(f"Deleted {archive}")
 
 
 def main() -> int:
@@ -232,9 +282,9 @@ def main() -> int:
         plan = build_move_plan(song_dirs, output_dir)
 
         if args.dry_run:
-            print_plan(plan)
+            print_plan(plan, delete_archives=args.delete_archives)
         else:
-            move_songs(plan, output_dir)
+            move_songs(plan, output_dir, delete_archives=args.delete_archives)
 
     return 0
 

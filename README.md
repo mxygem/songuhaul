@@ -25,6 +25,8 @@ The CLI:
 
 If two songs have the same folder name, the later destination is suffixed with `-2`, `-3`, and so on.
 
+When `--delete-archives` is set with `--no-dry-run`, original input archives are deleted after their discovered song folders are successfully moved. For songs found inside nested archives, `songuhaul` deletes the top-level archive from the input directory, not temporary archives extracted during processing.
+
 ## Build
 
 There is no package build step required. The CLI is a standalone Python script with no Python dependencies.
@@ -54,6 +56,12 @@ Actually move the discovered song folders:
 
 ```bash
 ./songuhaul.py --input /path/to/downloads --output /path/to/clone-hero/songs --no-dry-run
+```
+
+Move songs and delete the original input archives after successful moves:
+
+```bash
+./songuhaul.py --input /path/to/downloads --output /path/to/clone-hero/songs --no-dry-run --delete-archives
 ```
 
 Short flags are also available:
