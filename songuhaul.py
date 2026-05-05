@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,6 +34,43 @@ class MovePlan:
     destination: Path
     archive: Path | None
     deletable_archive: Path | None
+
+
+def record_failure(failures: list[str] | None, message: str) -> None:
+    if failures is None:
+        print(f"warning: {message}", file=sys.stderr)
+        return
+
+    failures.append(message)
+
+
+def print_failure_summary(failures: list[str]) -> None:
+    if not failures:
+        return
+
+    print(file=sys.stderr)
+    print("Failures encountered:", file=sys.stderr)
+    for failure in failures:
+        print(f"- {failure}", file=sys.stderr)
+
+
+def record_duplicate(duplicates: list[str] | None, source: Path, destination: Path) -> None:
+    message = f"{source} -> {destination}"
+    if duplicates is None:
+        print(f"warning: skipping duplicate song already in output: {destination}", file=sys.stderr)
+        return
+
+    duplicates.append(message)
+
+
+def print_duplicate_summary(duplicates: list[str]) -> None:
+    if not duplicates:
+        return
+
+    print(file=sys.stderr)
+    print("Duplicates skipped:", file=sys.stderr)
+    for duplicate in duplicates:
+        print(f"- {duplicate}", file=sys.stderr)
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,7 +189,36 @@ def extract_7z_archive(archive: Path, destination: Path) -> None:
     subprocess.run([bsdtar, "-xf", str(archive), "-C", str(destination)], check=True)
 
 
-def collect_song_directories(input_dir: Path, work_dir: Path) -> list[SongDiscovery]:
+def make_tree_owner_writable(path: Path) -> None:
+    """Allow the current user to move and clean up archive-extracted trees."""
+    chmod_owner_writable(path)
+    for root, dirnames, filenames in os.walk(path, topdown=True, followlinks=False):
+        root_path = Path(root)
+        for dirname in dirnames:
+            chmod_owner_writable(root_path / dirname)
+        for filename in filenames:
+            chmod_owner_writable(root_path / filename)
+
+
+def chmod_owner_writable(path: Path) -> None:
+    if path.is_symlink():
+        return
+
+    mode = stat.S_IMODE(path.stat().st_mode)
+    required = stat.S_IRUSR | stat.S_IWUSR
+    if path.is_dir():
+        required |= stat.S_IXUSR
+
+    updated_mode = mode | required
+    if updated_mode != mode:
+        path.chmod(updated_mode)
+
+
+def collect_song_directories(
+    input_dir: Path,
+    work_dir: Path,
+    failures: list[str] | None = None,
+) -> list[SongDiscovery]:
     """Return song folders and the archives they came from."""
     discovered = [
         SongDiscovery(source=song_dir, archive=None, deletable_archive=None)
@@ -171,13 +239,13 @@ def collect_song_directories(input_dir: Path, work_dir: Path) -> list[SongDiscov
         try:
             extract_archive(archive, extract_to)
         except zipfile.BadZipFile:
-            print(f"warning: skipping invalid zip archive: {archive}", file=sys.stderr)
+            record_failure(failures, f"skipping invalid zip archive: {archive}")
             continue
         except ValueError as error:
-            print(f"warning: {error}", file=sys.stderr)
+            record_failure(failures, str(error))
             continue
         except (RuntimeError, subprocess.CalledProcessError) as error:
-            print(f"warning: could not extract archive {archive}: {error}", file=sys.stderr)
+            record_failure(failures, f"could not extract archive {archive}: {error}")
             continue
 
         for song_dir in find_song_directories(extract_to):
@@ -196,9 +264,12 @@ def collect_song_directories(input_dir: Path, work_dir: Path) -> list[SongDiscov
     return discovered
 
 
-def unique_destination(output_dir: Path, name: str, reserved: set[Path]) -> Path:
+def unique_destination(output_dir: Path, name: str, reserved: set[Path]) -> Path | None:
     candidate = output_dir / name
-    if candidate not in reserved and not candidate.exists():
+    if candidate.exists():
+        return None
+
+    if candidate not in reserved:
         reserved.add(candidate)
         return candidate
 
@@ -211,12 +282,20 @@ def unique_destination(output_dir: Path, name: str, reserved: set[Path]) -> Path
         counter += 1
 
 
-def build_move_plan(song_dirs: list[SongDiscovery], output_dir: Path) -> list[MovePlan]:
+def build_move_plan(
+    song_dirs: list[SongDiscovery],
+    output_dir: Path,
+    duplicates: list[str] | None = None,
+) -> list[MovePlan]:
     reserved: set[Path] = set()
     plan: list[MovePlan] = []
 
     for song_dir in song_dirs:
         destination = unique_destination(output_dir, song_dir.source.name, reserved)
+        if destination is None:
+            record_duplicate(duplicates, song_dir.source, output_dir / song_dir.source.name)
+            continue
+
         plan.append(
             MovePlan(
                 source=song_dir.source,
@@ -255,16 +334,47 @@ def print_plan(plan: list[MovePlan], delete_archives: bool = False) -> None:
                 print(f"- {archive}")
 
 
-def move_songs(plan: list[MovePlan], output_dir: Path, delete_archives: bool = False) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
+def move_songs(
+    plan: list[MovePlan],
+    output_dir: Path,
+    delete_archives: bool = False,
+    failures: list[str] | None = None,
+    duplicates: list[str] | None = None,
+) -> None:
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        record_failure(failures, f"could not create output directory {output_dir}: {error}")
+        return
+
+    moved: list[MovePlan] = []
     for item in plan:
-        shutil.move(str(item.source), str(item.destination))
+        if item.destination.exists():
+            record_duplicate(duplicates, item.source, item.destination)
+            continue
+
+        try:
+            make_tree_owner_writable(item.source)
+            shutil.move(str(item.source), str(item.destination))
+        except (OSError, shutil.Error) as error:
+            record_failure(
+                failures,
+                f"could not move {item.source} to {item.destination}: {error}",
+            )
+            continue
+
+        moved.append(item)
         print(f"Moved {item.destination}")
 
     if delete_archives:
-        for archive in archives_to_delete(plan):
+        for archive in archives_to_delete(moved):
             if archive.exists():
-                archive.unlink()
+                try:
+                    archive.unlink()
+                except OSError as error:
+                    record_failure(failures, f"could not delete archive {archive}: {error}")
+                    continue
+
                 print(f"Deleted {archive}")
 
 
@@ -277,16 +387,33 @@ def main() -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
+    failures: list[str] = []
+    duplicates: list[str] = []
     with tempfile.TemporaryDirectory(prefix="songuhaul-") as temp_dir:
-        song_dirs = collect_song_directories(input_dir, Path(temp_dir))
-        plan = build_move_plan(song_dirs, output_dir)
+        temp_path = Path(temp_dir)
+        try:
+            song_dirs = collect_song_directories(input_dir, temp_path, failures=failures)
+            plan = build_move_plan(song_dirs, output_dir, duplicates=duplicates)
 
-        if args.dry_run:
-            print_plan(plan, delete_archives=args.delete_archives)
-        else:
-            move_songs(plan, output_dir, delete_archives=args.delete_archives)
+            if args.dry_run:
+                print_plan(plan, delete_archives=args.delete_archives)
+            else:
+                move_songs(
+                    plan,
+                    output_dir,
+                    delete_archives=args.delete_archives,
+                    failures=failures,
+                    duplicates=duplicates,
+                )
+        finally:
+            try:
+                make_tree_owner_writable(temp_path)
+            except OSError as error:
+                record_failure(failures, f"could not prepare temporary directory for cleanup: {error}")
 
-    return 0
+    print_duplicate_summary(duplicates)
+    print_failure_summary(failures)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

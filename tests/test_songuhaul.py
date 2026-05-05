@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import shutil
+import stat
 import tempfile
 import unittest
 import zipfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -97,6 +98,110 @@ class TestSongFixtures(unittest.TestCase):
             {item.destination.name for item in plan},
         )
 
+    def test_move_plan_skips_song_already_in_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            source = root / "input" / "Duplicate Song"
+            write_song_files(source)
+            write_song_files(output_dir / "Duplicate Song")
+
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                plan = songuhaul.build_move_plan(
+                    [
+                        songuhaul.SongDiscovery(
+                            source=source,
+                            archive=None,
+                            deletable_archive=None,
+                        )
+                    ],
+                    output_dir,
+                )
+
+            self.assertEqual([], plan)
+            self.assertIn("warning: skipping duplicate song already in output", stderr.getvalue())
+
+    def test_move_plan_collects_duplicate_already_in_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            source = root / "input" / "Duplicate Song"
+            destination = output_dir / "Duplicate Song"
+            write_song_files(source)
+            write_song_files(destination)
+
+            duplicates: list[str] = []
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                plan = songuhaul.build_move_plan(
+                    [
+                        songuhaul.SongDiscovery(
+                            source=source,
+                            archive=None,
+                            deletable_archive=None,
+                        )
+                    ],
+                    output_dir,
+                    duplicates=duplicates,
+                )
+
+            self.assertEqual([], plan)
+            self.assertEqual("", stderr.getvalue())
+            self.assertEqual([f"{source} -> {destination}"], duplicates)
+
+    def test_move_plan_suffixes_duplicate_names_from_same_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            first = root / "input-a" / "Duplicate Song"
+            second = root / "input-b" / "Duplicate Song"
+            write_song_files(first)
+            write_song_files(second)
+
+            plan = songuhaul.build_move_plan(
+                [
+                    songuhaul.SongDiscovery(
+                        source=first,
+                        archive=None,
+                        deletable_archive=None,
+                    ),
+                    songuhaul.SongDiscovery(
+                        source=second,
+                        archive=None,
+                        deletable_archive=None,
+                    ),
+                ],
+                output_dir,
+            )
+
+            self.assertEqual(
+                [output_dir / "Duplicate Song", output_dir / "Duplicate Song-2"],
+                [item.destination for item in plan],
+            )
+
+    def test_collect_song_directories_collects_invalid_archive_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "input"
+            work_dir = root / "work"
+            input_dir.mkdir()
+            (input_dir / "broken.zip").write_text("not a real zip")
+
+            failures: list[str] = []
+            stderr = StringIO()
+            with redirect_stderr(stderr):
+                discoveries = songuhaul.collect_song_directories(
+                    input_dir,
+                    work_dir,
+                    failures=failures,
+                )
+
+            self.assertEqual([], discoveries)
+            self.assertEqual("", stderr.getvalue())
+            self.assertEqual(1, len(failures))
+            self.assertIn("skipping invalid zip archive", failures[0])
+
     def test_move_songs_deletes_original_archive_after_successful_move(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -122,6 +227,178 @@ class TestSongFixtures(unittest.TestCase):
             self.assertFalse(archive.exists())
             self.assertTrue((output_dir / "Delete Me").is_dir())
             self.assertTrue((output_dir / "Delete Me" / "song.ini").is_file())
+
+    def test_move_songs_makes_read_only_extracted_tree_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "input" / "Locked Song"
+            output_dir = root / "output"
+            write_song_files(source)
+            extra_dir = source / "album"
+            extra_dir.mkdir()
+            extra_file = extra_dir / "cover.txt"
+            extra_file.write_text("cover")
+
+            (source / "song.ini").chmod(0o400)
+            extra_file.chmod(0o400)
+            extra_dir.chmod(0o500)
+            source.chmod(0o500)
+
+            plan = [
+                songuhaul.MovePlan(
+                    source=source,
+                    destination=output_dir / source.name,
+                    archive=None,
+                    deletable_archive=None,
+                )
+            ]
+
+            with redirect_stdout(StringIO()):
+                songuhaul.move_songs(plan, output_dir)
+
+            destination = output_dir / "Locked Song"
+            self.assertTrue(destination.is_dir())
+            self.assertTrue(destination.stat().st_mode & stat.S_IWUSR)
+            self.assertTrue((destination / "album").stat().st_mode & stat.S_IWUSR)
+            self.assertTrue((destination / "song.ini").stat().st_mode & stat.S_IWUSR)
+            self.assertTrue((destination / "album" / "cover.txt").stat().st_mode & stat.S_IWUSR)
+
+    def test_move_songs_skips_duplicate_destination_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            duplicate_source = root / "input" / "Duplicate Song"
+            next_source = root / "input" / "Next Song"
+            duplicate_destination = output_dir / "Duplicate Song"
+            next_destination = output_dir / "Next Song"
+            write_song_files(duplicate_source)
+            write_song_files(next_source)
+            write_song_files(duplicate_destination)
+
+            plan = [
+                songuhaul.MovePlan(
+                    source=duplicate_source,
+                    destination=duplicate_destination,
+                    archive=None,
+                    deletable_archive=None,
+                ),
+                songuhaul.MovePlan(
+                    source=next_source,
+                    destination=next_destination,
+                    archive=None,
+                    deletable_archive=None,
+                ),
+            ]
+
+            stderr = StringIO()
+            with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                songuhaul.move_songs(plan, output_dir)
+
+            self.assertIn("warning: skipping duplicate song already in output", stderr.getvalue())
+            self.assertTrue(duplicate_source.is_dir())
+            self.assertTrue(duplicate_destination.is_dir())
+            self.assertFalse(next_source.exists())
+            self.assertTrue(next_destination.is_dir())
+
+    def test_move_songs_collects_duplicate_destination_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            duplicate_source = root / "input" / "Duplicate Song"
+            next_source = root / "input" / "Next Song"
+            duplicate_destination = output_dir / "Duplicate Song"
+            next_destination = output_dir / "Next Song"
+            write_song_files(duplicate_source)
+            write_song_files(next_source)
+            write_song_files(duplicate_destination)
+
+            plan = [
+                songuhaul.MovePlan(
+                    source=duplicate_source,
+                    destination=duplicate_destination,
+                    archive=None,
+                    deletable_archive=None,
+                ),
+                songuhaul.MovePlan(
+                    source=next_source,
+                    destination=next_destination,
+                    archive=None,
+                    deletable_archive=None,
+                ),
+            ]
+
+            duplicates: list[str] = []
+            stderr = StringIO()
+            with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                songuhaul.move_songs(plan, output_dir, duplicates=duplicates)
+
+            self.assertEqual("", stderr.getvalue())
+            self.assertEqual([f"{duplicate_source} -> {duplicate_destination}"], duplicates)
+            self.assertTrue(duplicate_source.is_dir())
+            self.assertTrue(duplicate_destination.is_dir())
+            self.assertFalse(next_source.exists())
+            self.assertTrue(next_destination.is_dir())
+
+    def test_move_songs_collects_failure_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            missing_source = root / "input" / "Missing Song"
+            next_source = root / "input" / "Next Song"
+            next_destination = output_dir / "Next Song"
+            write_song_files(next_source)
+
+            plan = [
+                songuhaul.MovePlan(
+                    source=missing_source,
+                    destination=output_dir / missing_source.name,
+                    archive=None,
+                    deletable_archive=None,
+                ),
+                songuhaul.MovePlan(
+                    source=next_source,
+                    destination=next_destination,
+                    archive=None,
+                    deletable_archive=None,
+                ),
+            ]
+
+            failures: list[str] = []
+            stderr = StringIO()
+            with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                songuhaul.move_songs(plan, output_dir, failures=failures)
+
+            self.assertEqual("", stderr.getvalue())
+            self.assertEqual(1, len(failures))
+            self.assertIn("could not move", failures[0])
+            self.assertIn("Missing Song", failures[0])
+            self.assertFalse(next_source.exists())
+            self.assertTrue(next_destination.is_dir())
+
+    def test_failure_summary_reports_all_failures(self) -> None:
+        failures = ["first failure", "second failure"]
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            songuhaul.print_failure_summary(failures)
+
+        self.assertIn("Failures encountered:", stderr.getvalue())
+        self.assertIn("- first failure", stderr.getvalue())
+        self.assertIn("- second failure", stderr.getvalue())
+
+    def test_duplicate_summary_reports_all_duplicates(self) -> None:
+        duplicates = [
+            "/input/First Song -> /output/First Song",
+            "/input/Second Song -> /output/Second Song",
+        ]
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            songuhaul.print_duplicate_summary(duplicates)
+
+        self.assertIn("Duplicates skipped:", stderr.getvalue())
+        self.assertIn("- /input/First Song -> /output/First Song", stderr.getvalue())
+        self.assertIn("- /input/Second Song -> /output/Second Song", stderr.getvalue())
 
 
 if __name__ == "__main__":
